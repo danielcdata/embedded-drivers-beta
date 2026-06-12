@@ -8,9 +8,12 @@ MCP tools for CData Embedded / OEM driver management.
 
 Review CData connector changelogs and discover available releases.
 
+Workflow: `list_releases` → `list_sources` → `get_changelog`.
+
 | Tool | Description                                                                              |
 |------|------------------------------------------------------------------------------------------|
 | `list_releases` | List CData connector releases (e.g. 2025 U1, 2025 U2)                                    |
+| `list_sources` | List the valid connector names (`provider_name`) for an edition and major version |
 | `get_changelog` | Retrieve filtered changelog entries for a specific connector |
 
 **Example prompts:**

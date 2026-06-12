@@ -274,9 +274,18 @@ public class ChangelogReviewServer {
         return m;
     }
 
+    /** Builds a string property constrained to a fixed set of values (rendered as a JSON Schema enum). */
+    private static Map<String, Object> schemaEnum(String description, Collection<String> values) {
+        Map<String, Object> m = new LinkedHashMap<String, Object>();
+        m.put("type", "string");
+        m.put("description", description);
+        m.put("enum", new ArrayList<String>(values));
+        return m;
+    }
+
     private static McpSchema.JsonSchema getChangelogSchema() {
         Map<String, Object> props = new LinkedHashMap<String, Object>();
-        props.put("edition",              schemaProperty("string",  "One of: JDBC, ADO .NET FRAMEWORK, ADO .NET STANDARD, ODBC UNIX, ODBC WINDOWS, PYTHON MAC, PYTHON UNIX, PYTHON WINDOWS"));
+        props.put("edition",              schemaEnum("Driver edition.", EDITION_SUBPATHS.keySet()));
         props.put("provider_name",         schemaProperty("string",  "Connector provider name (e.g. Salesforce)"));
         props.put("major_version",        schemaProperty("integer", "Major version year from list_releases (e.g. 2025). Each major version has its own independent changelog."));
         props.put("after_release_number", schemaProperty("integer", "The U-number exactly as shown by list_releases. For '2025 U1' use 1, for '2025 U2' use 2. Must be >= 1. Do NOT subtract or compute — use the number directly."));
@@ -346,6 +355,15 @@ public class ChangelogReviewServer {
     private static final Pattern PAT_BLD_ODBC   = Pattern.compile("^bld-[Cc][Dd]ata\\.[Oo][Dd][Bb][Cc]\\.(.+)\\.(\\d+)$");
     private static final Pattern PAT_BLD_PYTHON = Pattern.compile("^bld-(.+)\\.(\\d+)$");
 
+    /** Returns the bld-* marker filename pattern for an edition (uppercased). */
+    private static Pattern bldPatternFor(String editionUpper) {
+        if      (editionUpper.startsWith("ADO"))    return PAT_BLD_ADO;
+        else if (editionUpper.equals("JDBC"))       return PAT_BLD_JDBC;
+        else if (editionUpper.startsWith("ODBC"))   return PAT_BLD_ODBC;
+        else if (editionUpper.startsWith("PYTHON")) return PAT_BLD_PYTHON;
+        else throw new IllegalArgumentException("Unknown edition: " + editionUpper);
+    }
+
     /**
      * Resolves a release (major version + U-number) to its build number
      * via hardcoded releases or S3 build marker lookup.
@@ -363,12 +381,7 @@ public class ChangelogReviewServer {
             throw new IllegalArgumentException(releaseErr);
 
         String eu = edition.toUpperCase(Locale.ROOT);
-        Pattern pat;
-        if      (eu.startsWith("ADO"))    pat = PAT_BLD_ADO;
-        else if (eu.equals("JDBC"))       pat = PAT_BLD_JDBC;
-        else if (eu.startsWith("ODBC"))   pat = PAT_BLD_ODBC;
-        else if (eu.startsWith("PYTHON")) pat = PAT_BLD_PYTHON;
-        else throw new IllegalArgumentException("Unknown edition: " + edition);
+        Pattern pat = bldPatternFor(eu);
 
         String releasePath = releaseTag + "/" + EDITION_SUBPATHS.get(edition);
         for (String key : listS3Objects(releasePath + "/bld-")) {
@@ -378,7 +391,8 @@ public class ChangelogReviewServer {
                 return Integer.parseInt(m.group(2));
         }
         throw new IllegalArgumentException("No build found for '" + objName + "' in " +
-                edition + " / " + releaseTag + ". Verify the provider name spelling.");
+                edition + " / " + releaseTag + " (major version " + majorVersion + ")." +
+                sourceHint(objName, edition, majorVersion));
     }
 
     /**
@@ -395,6 +409,86 @@ public class ChangelogReviewServer {
             sb.append(String.format("  %s  (year=%d, release_number=%d)%n", r.label(), r.year, r.releaseNumber));
         sb.append("\nPlease ask the user which release they want.");
         return stripTrailing(sb.toString());
+    }
+
+    // -- Source (provider name) discovery --
+
+    /** True if the string contains at least one uppercase letter. */
+    private static boolean hasUpper(String s) {
+        for (int i = 0; i < s.length(); i++)
+            if (Character.isUpperCase(s.charAt(i))) return true;
+        return false;
+    }
+
+    /**
+     * Lists the provider names available for an edition + major version, with canonical casing.
+     *
+     * The authoritative set is the changelog directory tree (every connector that has a changelog
+     * for that major version — exactly what get_changelog can fetch). Those directory names are
+     * lowercase, so we harvest canonical CamelCase from the build markers across the major version's
+     * releases and apply it where available, leaving any unmatched name in its lowercase form.
+     */
+    private static List<String> collectSources(String edition, int majorVersion) throws IOException {
+        String eu = edition.toUpperCase(Locale.ROOT);
+        String subpath = EDITION_SUBPATHS.get(eu);
+        String changelogPath = subpath.indexOf('/') >= 0 ? subpath.substring(0, subpath.indexOf('/')) : subpath;
+        String yy = String.valueOf(majorVersion % 100);
+
+        // Authoritative set: the (lowercase) connector directories under the changelog tree.
+        Set<String> authoritative = new TreeSet<String>();
+        String clPrefix = "changelogs/v" + yy + "/" + changelogPath + "/";
+        for (String key : listS3Objects(clPrefix)) {
+            if (!key.startsWith(clPrefix)) continue;
+            String rest = key.substring(clPrefix.length());
+            int slash = rest.indexOf('/');
+            if (slash > 0) authoritative.add(rest.substring(0, slash));
+        }
+
+        // Casing map: lowercase -> canonical CamelCase, harvested from build markers. Prefer a value
+        // that carries uppercase letters so a stray lowercase marker can't override the canonical name.
+        Map<String, String> casing = new HashMap<String, String>();
+        Pattern pat = bldPatternFor(eu);
+        for (Release r : listAvailableReleases()) {
+            if (r.year != majorVersion) continue;
+            for (String key : listS3Objects(r.tag() + "/" + subpath + "/bld-")) {
+                String filename = key.substring(key.lastIndexOf('/') + 1);
+                Matcher m = pat.matcher(filename);
+                if (!m.matches()) continue;
+                String name = m.group(1);
+                String lower = name.toLowerCase(Locale.ROOT);
+                String existing = casing.get(lower);
+                if (existing == null || (!hasUpper(existing) && hasUpper(name)))
+                    casing.put(lower, name);
+            }
+        }
+
+        Set<String> result = new TreeSet<String>(String.CASE_INSENSITIVE_ORDER);
+        if (authoritative.isEmpty()) {
+            result.addAll(casing.values()); // unexpected: no changelog tree — fall back to markers
+        } else {
+            for (String lower : authoritative) {
+                String canon = casing.get(lower);
+                result.add(canon != null ? canon : lower);
+            }
+        }
+        return new ArrayList<String>(result);
+    }
+
+    /** Builds guidance for a bad provider name: close matches if any, else a pointer to list_sources. */
+    private static String sourceHint(String attempted, String edition, int majorVersion) {
+        try {
+            List<String> all = collectSources(edition, majorVersion);
+            List<String> near = new ArrayList<String>();
+            String needle = attempted.toLowerCase(Locale.ROOT);
+            for (String s : all) {
+                String sl = s.toLowerCase(Locale.ROOT);
+                if (sl.contains(needle) || needle.contains(sl)) near.add(s);
+            }
+            if (!near.isEmpty())
+                return " Did you mean: " + String.join(", ", near.subList(0, Math.min(near.size(), 15))) + "?";
+        } catch (Exception ignored) {}
+        return " Call list_sources with edition='" + edition + "' and major_version=" + majorVersion +
+               " to see all valid provider names.";
     }
 
     // -- Handler --
@@ -458,7 +552,8 @@ public class ChangelogReviewServer {
         }
 
         if (res.status == 404)
-            return err("No changelog found for '" + objName + "' (" + edition + ") in major version " + majorVersion + ".");
+            return err("No changelog found for '" + objName + "' (" + edition + ") in major version " + majorVersion + "." +
+                sourceHint(objName, edition, majorVersion));
         if (res.status != 200)
             return err("HTTP " + res.status + " fetching changelog for '" + objName + "'.");
 
@@ -492,6 +587,50 @@ public class ChangelogReviewServer {
     }
 
     // ============================================================
+    //  TOOL: list_sources
+    // ============================================================
+
+    private static McpSchema.JsonSchema listSourcesSchema() {
+        Map<String, Object> props = new LinkedHashMap<String, Object>();
+        props.put("edition",       schemaEnum("Driver edition.", EDITION_SUBPATHS.keySet()));
+        props.put("major_version", schemaProperty("integer", "Major version year from list_releases (e.g. 2025)."));
+        return new McpSchema.JsonSchema("object", props,
+            Arrays.asList("edition", "major_version"), null, null, null);
+    }
+
+    private static CallToolResult handleListSources(Map<String, Object> args) {
+        Integer majorVersion = optIntArg(args, "major_version");
+        if (majorVersion == null)
+            return err("major_version is required. Call list_releases to see available major versions.");
+
+        String editionRaw = stringArg(args, "edition");
+        if (editionRaw == null)
+            return err("edition is required.");
+        String edition = editionRaw.toUpperCase(Locale.ROOT);
+        if (!EDITION_SUBPATHS.containsKey(edition))
+            return err("Unknown edition '" + editionRaw + "'. Valid editions: " + String.join(", ", EDITION_SUBPATHS.keySet()));
+
+        List<String> sources;
+        try {
+            sources = collectSources(edition, majorVersion);
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+            return err("Error listing sources: " + e.getMessage());
+        }
+
+        if (sources.isEmpty())
+            return ok("No connectors found for " + edition + " in major version " + majorVersion + ".");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("%d connector%s available for %s in major version %d ",
+            sources.size(), sources.size() == 1 ? "" : "s", edition, majorVersion));
+        sb.append("(use one verbatim as provider_name in get_changelog):\n");
+        for (String s : sources)
+            sb.append("  ").append(s).append('\n');
+        return ok(stripTrailing(sb.toString()));
+    }
+
+    // ============================================================
     //  MAIN
     // ============================================================
 
@@ -500,7 +639,7 @@ public class ChangelogReviewServer {
             new StdioServerTransportProvider(McpJsonDefaults.getMapper());
 
         McpServer.sync(transport)
-            .serverInfo("cdata-changelog-review-mcp", "1.0.0")
+            .serverInfo("cdata-changelog-review-mcp", "1.1.0")
             .capabilities(ServerCapabilities.builder().tools(true).build())
 
             .toolCall(
@@ -508,6 +647,7 @@ public class ChangelogReviewServer {
                     .name("list_releases")
                     .description(
                         "List available CData connector releases, newest first. " +
+                        "Step 1 of the workflow: list_releases → list_sources → get_changelog. " +
                         "MUST be called before get_changelog — only use release numbers returned here. " +
                         "Do NOT guess or assume release numbers — only releases returned by this tool are valid. " +
                         "No arguments required.")
@@ -518,11 +658,26 @@ public class ChangelogReviewServer {
 
             .toolCall(
                 McpSchema.Tool.builder()
+                    .name("list_sources")
+                    .description(
+                        "List the valid provider_name values (connectors) for an edition and major version. " +
+                        "Step 2 of the workflow: list_releases → list_sources → get_changelog. " +
+                        "Call this before get_changelog whenever you are unsure of the exact connector name — " +
+                        "do NOT guess provider names. Use a returned name verbatim as get_changelog's provider_name. " +
+                        "Requires edition and major_version.")
+                    .inputSchema(listSourcesSchema())
+                    .build(),
+                (exchange, request) -> handleListSources(
+                    request.arguments() != null ? request.arguments() : Collections.<String, Object>emptyMap()))
+
+            .toolCall(
+                McpSchema.Tool.builder()
                     .name("get_changelog")
                     .description(
                         "Get changelog entries for a CData connector since a release, date, or build. " +
                         "Each major version has its own independent changelog. " +
                         "IMPORTANT: Call list_releases first. Do NOT invent or guess release numbers. " +
+                        "If unsure of the exact provider_name, call list_sources first and use a name from it verbatim. " +
                         "The major_version is NOT the current calendar year — it is the version year from list_releases. " +
                         "Requires EXACTLY ONE of: " +
                         "after_release_number (U-number, e.g. 2 for U2), " +
